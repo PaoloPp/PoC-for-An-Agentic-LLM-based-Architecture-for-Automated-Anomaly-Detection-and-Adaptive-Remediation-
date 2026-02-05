@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "objective": {
+      "type": "string",
+      "enum": ["investigate", "contain", "eradicate", "recover"]
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "step_id": { "type": "string" },
+          "tool_id": { "type": "string" },
+          "inputs": { "type": "object" },
+          "why": { "type": "string" },
+          "verify": { "type": "string" },
+          "rollback": { "type": "string" }
+        },
+        "required": ["step_id", "tool_id", "inputs", "why", "verify", "rollback"]
+      }
+    },
+    "risk_notes": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    }
+  },
+  "required": ["objective", "steps"]
+}

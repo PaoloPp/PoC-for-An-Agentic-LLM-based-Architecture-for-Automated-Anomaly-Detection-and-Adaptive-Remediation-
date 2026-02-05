@@ -1,0 +1,11 @@
+numpy
+fastapi
+uvicorn[standard]
+redis
+sqlalchemy
+psycopg[binary]
+jsonschema
+requests
+pydantic
+pgvector
+

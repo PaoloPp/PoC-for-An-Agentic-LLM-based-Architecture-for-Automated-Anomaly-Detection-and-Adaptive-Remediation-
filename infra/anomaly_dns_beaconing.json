@@ -1,0 +1,38 @@
+{
+  "anomaly_id": "a-net-0007",
+  "timestamp": "2026-02-02T21:12:00Z",
+  "resource_group": "rg-staging-web",
+  "environment": "staging",
+  "signal": {
+    "type": "network",
+    "summary": "Periodic DNS queries and outbound beacons to suspicious domain, consistent intervals",
+    "severity": "medium",
+    "confidence": 0.71
+  },
+  "entities": {
+    "hosts": ["web-stg-02"],
+    "ips": ["192.0.2.55"],
+    "domains": ["update-check.example-bad.tld"],
+    "processes": ["unknown.exe"]
+  },
+  "evidence": [
+    {
+      "source": "ndr",
+      "ref": "flowset_66210",
+      "details": {
+        "interval_seconds_mode": 60,
+        "interval_jitter_seconds": 3,
+        "dns_qps": 1.1,
+        "unique_subdomains_last_1h": 480,
+        "outbound_ports": [443]
+      }
+    }
+  ],
+  "constraints": {
+    "requires_human_approval": false,
+    "allowed_actions": ["collect_triage", "block_ip", "isolate_host"],
+    "forbidden_actions": ["wipe_host", "delete_data"],
+    "time_budget_minutes": 30,
+    "notes": "Staging system: blocking is acceptable; isolation should include rollback instructions."
+  }
+}

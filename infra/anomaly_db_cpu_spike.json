@@ -1,0 +1,36 @@
+{
+  "anomaly_id": "a-perf-0012",
+  "timestamp": "2026-02-02T21:14:00Z",
+  "resource_group": "rg-prod-db",
+  "environment": "prod",
+  "signal": {
+    "type": "availability",
+    "summary": "Database CPU sustained >90% with p95 latency degradation, possible slow query/regression",
+    "severity": "low",
+    "confidence": 0.55
+  },
+  "entities": {
+    "hosts": ["db-prod-01"],
+    "services": ["postgresql"],
+    "apps": ["payments-api"]
+  },
+  "evidence": [
+    {
+      "source": "metrics",
+      "ref": "grafana_panel_12",
+      "details": {
+        "cpu_pct_avg_10m": 94,
+        "p95_query_ms": 920,
+        "active_connections": 310,
+        "lock_waits_per_min": 48
+      }
+    }
+  ],
+  "constraints": {
+    "requires_human_approval": true,
+    "allowed_actions": ["collect_triage"],
+    "forbidden_actions": ["block_ip", "disable_user", "isolate_host", "wipe_host", "delete_data"],
+    "time_budget_minutes": 45,
+    "notes": "Do not take containment actions; focus on diagnostics and safe mitigation suggestions."
+  }
+}

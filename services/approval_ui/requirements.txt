@@ -1,0 +1,4 @@
+streamlit
+sqlalchemy
+psycopg[binary]
+requests

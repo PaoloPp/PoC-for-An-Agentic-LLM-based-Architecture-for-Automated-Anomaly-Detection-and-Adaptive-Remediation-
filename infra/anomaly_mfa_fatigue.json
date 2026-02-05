@@ -1,0 +1,38 @@
+{
+  "anomaly_id": "a-auth-0001",
+  "timestamp": "2026-02-02T21:10:00Z",
+  "resource_group": "rg-prod-payments",
+  "environment": "prod",
+  "signal": {
+    "type": "auth",
+    "summary": "Impossible travel + repeated MFA prompts (MFA fatigue) for a privileged user",
+    "severity": "high",
+    "confidence": 0.62
+  },
+  "entities": {
+    "users": ["alice"],
+    "hosts": ["pay-api-01"],
+    "ips": ["203.0.113.10", "198.51.100.77"],
+    "services": ["okta", "payments-api"]
+  },
+  "evidence": [
+    {
+      "source": "siem",
+      "ref": "event_id_891223",
+      "details": {
+        "geo_from": "Rome, IT",
+        "geo_to": "San Jose, US",
+        "minutes_between_logins": 11,
+        "mfa_prompts_last_10m": 24,
+        "mfa_approved": true
+      }
+    }
+  ],
+  "constraints": {
+    "requires_human_approval": true,
+    "allowed_actions": ["collect_triage", "block_ip", "disable_user", "isolate_host"],
+    "forbidden_actions": ["wipe_host", "delete_data", "factory_reset"],
+    "time_budget_minutes": 20,
+    "notes": "Treat as potential account takeover; prioritize containment with rollback and verification."
+  }
+}
