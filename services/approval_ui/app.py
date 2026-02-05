@@ -47,7 +47,28 @@ def _to_jsonable(v: Any) -> Any:
     return str(v)
 
 
-@st.cache_data(ttl=2)  # DB-backed UI should use a short ttl to avoid stale results :contentReference[oaicite:3]{index=3}
+def _get_nested(d, path, default=None):
+    cur = d
+    for k in path:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def _fmt_ms(ms):
+    if ms is None:
+        return "N/A"
+    try:
+        ms = int(ms)
+    except Exception:
+        return "N/A"
+    if ms < 1000:
+        return f"{ms} ms"
+    return f"{ms/1000:.2f} s"
+
+
+@st.cache_data(ttl=2)
 def load_cases() -> list[Dict[str, Any]]:
     eng = _engine()
     with eng.connect() as conn:
@@ -61,7 +82,6 @@ def load_cases() -> list[Dict[str, Any]]:
                 """
             )
         ).mappings().all()
-        # Convert RowMapping -> dict for reliable Streamlit rendering
         return [dict(r) for r in rows]
 
 
@@ -71,7 +91,7 @@ def load_case(case_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute(
             text("SELECT * FROM cases WHERE id=:id"),
             {"id": case_id},
-        ).mappings().one_or_none()  # avoids NoResultFound crash :contentReference[oaicite:4]{index=4}
+        ).mappings().one_or_none()
         return dict(row) if row else None
 
 
@@ -113,7 +133,7 @@ if not cases:
 selected_case = st.selectbox(
     "Select a case",
     options=cases,
-    format_func=case_label,  # display label without changing returned value :contentReference[oaicite:5]{index=5}
+    format_func=case_label,
 )
 
 case_id = str(selected_case["id"])
@@ -123,32 +143,53 @@ if case is None:
     st.warning("Case not found (it may have been deleted or not committed).")
     st.stop()
 
-# Header info
-meta1, meta2, meta3 = st.columns([1, 1, 2])
+# ---- Timing extraction (MTTR + LLM) ----
+validation_obj = _to_jsonable(case.get("validation")) or {}
+if isinstance(validation_obj, str):
+    # extremely defensive, _to_jsonable should already parse JSON strings
+    try:
+        validation_obj = json.loads(validation_obj)
+    except Exception:
+        validation_obj = {}
+
+timing = _get_nested(validation_obj, ["timing"], default={}) or {}
+mttr_ms = timing.get("mttr_ms")
+llm_ms = timing.get("llm_ms")
+ingested_at = timing.get("ingested_at")
+plan_generated_at = timing.get("plan_generated_at")
+
+# Header info (now includes MTTR)
+meta1, meta2, meta3, meta4 = st.columns([1, 1, 1, 2])
 with meta1:
     st.metric("Status", str(case.get("status", "UNKNOWN")))
 with meta2:
     st.metric("Case ID", case_id)
 with meta3:
-    st.write("")
+    st.metric("MTTR (POST → plan ready)", _fmt_ms(mttr_ms))
+with meta4:
+    st.metric("LLM time", _fmt_ms(llm_ms))
+
+# Optional timestamps (useful for screenshots/paper)
+if ingested_at or plan_generated_at:
+    st.caption(f"Ingested: {ingested_at or 'N/A'} · Plan generated: {plan_generated_at or 'N/A'}")
 
 # Main content
 left, right = st.columns([1, 1])
 
 with left:
     st.subheader("Anomaly")
-    st.json(_to_jsonable(case.get("anomaly")), expanded=2)  # pretty JSON rendering :contentReference[oaicite:6]{index=6}
+    st.json(_to_jsonable(case.get("anomaly")), expanded=2)
 
     st.subheader("Strategy / Plan")
-    st.json(_to_jsonable(case.get("strategy")), expanded=2)  # pretty JSON rendering :contentReference[oaicite:7]{index=7}
+    st.json(_to_jsonable(case.get("strategy")), expanded=2)
 
 with right:
     st.subheader("CACAO draft")
-    st.json(_to_jsonable(case.get("cacao_draft")), expanded=1)  # pretty JSON rendering :contentReference[oaicite:8]{index=8}
+    st.json(_to_jsonable(case.get("cacao_draft")), expanded=1)
 
     st.subheader("Validation")
-    st.json(_to_jsonable(case.get("validation")), expanded=2)  # pretty JSON rendering :contentReference[oaicite:9]{index=9}
+    st.json(_to_jsonable(case.get("validation")), expanded=2)
 
 # Optional raw dump for debugging
 with st.expander("Raw case record"):
-    st.json({k: _to_jsonable(v) for k, v in case.items()}, expanded=1)  # :contentReference[oaicite:10]{index=10}
+    st.json({k: _to_jsonable(v) for k, v in case.items()}, expanded=1)

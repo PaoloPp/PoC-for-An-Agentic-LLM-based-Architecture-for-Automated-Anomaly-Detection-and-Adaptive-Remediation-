@@ -3,23 +3,26 @@ import json
 import uuid
 import time
 import logging
-from typing import Any, Dict, List
+from copy import deepcopy
+from typing import Any, Dict, List, Tuple
 from pathlib import Path
-
+from datetime import datetime, timezone
 import redis
 import requests
+
 from jsonschema import Draft202012Validator, validate as js_validate, ValidationError
 from sqlalchemy import create_engine, text, event
 from pgvector.psycopg import register_vector
+
 
 # ---------------- Config ----------------
 REDIS_URL = os.environ["REDIS_URL"]
 DB_URL = os.environ["DATABASE_URL"]
 
 LLM_MODE = os.getenv("LLM_MODE", "stub").lower()  # "stub" or "ollama"
+
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.1:8b-instruct")
-OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "embeddinggemma")  # used only if you embed later
+OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.1:8b")  # make sure this exists in `ollama list`
 
 STREAM_IN = os.getenv("STREAM_IN", "confirmed_anomalies")
 STREAM_OUT_READY = os.getenv("STREAM_OUT_READY", "playbook_ready")
@@ -28,32 +31,48 @@ STREAM_NOTIFICATIONS = os.getenv("STREAM_NOTIFICATIONS", "notifications")
 
 CONSUMER_GROUP = os.getenv("CONSUMER_GROUP", "playbook_agent")
 CONSUMER_NAME = os.getenv("CONSUMER_NAME", f"agent-{uuid.uuid4().hex[:6]}")
+
 MAX_STREAM_LEN = int(os.getenv("MAX_STREAM_LEN", "10000"))
 BLOCK_MS = int(os.getenv("BLOCK_MS", "5000"))
 
-CACAO_SCHEMA_REPO = os.getenv("CACAO_SCHEMA_REPO", "cyentific-rni/cacao-json-schemas")
+CACAO_SCHEMA_REPO = os.getenv("CACAO_SCHEMA_REPO", "oasis-open/cacao-json-schemas")
 CACAO_SCHEMA_BRANCH = os.getenv("CACAO_SCHEMA_BRANCH", "cacao-v2.0-cs01")
 CACAO_SCHEMA_PATH = os.getenv("CACAO_SCHEMA_PATH", "schemas/playbook.json")
+
+PLAN_SCHEMA_PATH = os.getenv("PLAN_SCHEMA_PATH", "schemas/plan.schema.json")
+
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("playbook_agent_worker")
 
+
 # ---------------- Redis ----------------
 r = redis.from_url(REDIS_URL, decode_responses=True)
 
+
 # ---------------- DB + pgvector registration ----------------
 db = create_engine(DB_URL, pool_pre_ping=True)
+
 
 @event.listens_for(db, "connect")
 def _register_pgvector(dbapi_connection, connection_record):
     register_vector(dbapi_connection)
 
+
+def utc_now_iso() -> str:
+    # CACAO wants milliseconds. We'll keep normal ISO but include timezone.
+    # If you want strict millis: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return datetime.now(timezone.utc).isoformat()
+
+
 def _ollama_api_url(path: str) -> str:
     base = OLLAMA_BASE_URL.rstrip("/")
+    # Ollama docs say `/api/generate`, so we normalize both "http://.../api" and "http://..."
     if base.endswith("/api"):
         return f"{base}{path}"
     return f"{base}/api{path}"
+
 
 # ---------------- CACAO Schema ----------------
 def load_cacao_schema() -> Dict[str, Any]:
@@ -63,119 +82,171 @@ def load_cacao_schema() -> Dict[str, Any]:
         raise RuntimeError(f"Failed to fetch CACAO schema: {schema_url} -> {resp.status_code} {resp.text[:200]}")
     return resp.json()
 
+
 CACAO_SCHEMA = load_cacao_schema()
 CACAO_VALIDATOR = Draft202012Validator(CACAO_SCHEMA)
+
 
 def validate_cacao(playbook: Dict[str, Any]) -> List[str]:
     errors = sorted(CACAO_VALIDATOR.iter_errors(playbook), key=lambda e: list(e.path))
     return [f"{list(e.path)}: {e.message}" for e in errors]
 
+
 # ---------------- Tool registry ----------------
 def load_tools(environment: str, assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    asset_types = sorted({a.get("asset_type","server") for a in (assets or [])})
+    asset_types = sorted({a.get("asset_type", "server") for a in (assets or [])})
     with db.begin() as conn:
         rows = conn.execute(
-            text("""
+            text(
+                """
                 SELECT id, name, description, risk, requires_approval, environments, asset_types,
                        inputs_schema, openc2_template
                 FROM tools
                 WHERE :env = ANY(environments)
-            """),
+                """
+            ),
             {"env": environment},
         ).mappings().all()
 
     tools = [dict(r) for r in rows]
-    # Filter down to relevant asset types (keep "general" tools if you tag them with many types)
+
+    # Filter down to relevant asset types (keep "general" tools if you tag them broadly)
     if asset_types:
         tools = [t for t in tools if any(at in (t.get("asset_types") or []) for at in asset_types)]
     return tools
 
+
 def tool_index(tools: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {t["id"]: t for t in tools}
 
+
+# ---------------- Plan schema ----------------
+PLAN_SCHEMA: Dict[str, Any] = json.loads(Path(PLAN_SCHEMA_PATH).read_text())
+
+
+def build_plan_schema_with_tool_enum(tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Constrain tool_id to only valid tool IDs so the model can't invent 'unknown'.
+    """
+    schema = deepcopy(PLAN_SCHEMA)
+    tool_ids = [t["id"] for t in tools if "id" in t]
+    try:
+        schema["properties"]["steps"]["items"]["properties"]["tool_id"]["enum"] = tool_ids
+    except Exception:
+        # if your schema structure changes, don't crash the worker
+        log.warning("Could not inject tool_id enum into PLAN_SCHEMA (schema structure unexpected)")
+    return schema
+
+
 # ---------------- LLM Plan ----------------
-PLAN_SCHEMA = json.loads(Path("schemas/plan.schema.json").read_text())
-
-
-def llm_plan_stub(anomaly: Dict[str, Any], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # Dumb but deterministic fallback
+def llm_plan_stub(anomaly: Dict[str, Any], tools: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], int]:
+    start = time.perf_counter()
     first = tools[0]["id"] if tools else "noop"
-    return {
+    plan = {
         "objective": "investigate",
-        "steps": [{
-            "step_id": "S1",
-            "tool_id": first,
-            "inputs": {},
-            "why": "Stub plan",
-            "verify": "Check telemetry",
-            "rollback": "N/A"
-        }],
+        "steps": [
+            {
+                "step_id": "s-0001",
+                "tool_id": first,
+                "inputs": {},
+                "why": "Stub plan (LLM_MODE=stub).",
+                "verify": "Check telemetry after triage.",
+                "rollback": "N/A",
+            }
+        ],
         "confidence": 0.2,
-        "risk_notes": ["Stub mode"]
+        "risk_notes": ["Stub mode"],
     }
+    ms = int((time.perf_counter() - start) * 1000)
+    return plan, ms
 
-def llm_plan_ollama(anomaly: Dict[str, Any], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # Provide the model the anomaly + tools (capabilities).
-    tool_summaries = [{
-        "id": t["id"],
-        "name": t["name"],
-        "description": t["description"],
-        "risk": t["risk"],
-        "requires_approval": t["requires_approval"],
-        "inputs_schema": t["inputs_schema"],
-        "asset_types": t.get("asset_types", [])
-    } for t in tools]
 
-    prompt = {
+def llm_plan_ollama(anomaly: Dict[str, Any], tools: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], int]:
+    """
+    Uses Ollama structured outputs (format=json schema).
+    Returns (plan, llm_ms).
+    """
+    tool_summaries = [
+        {
+            "id": t["id"],
+            "name": t["name"],
+            "description": t["description"],
+            "risk": t["risk"],
+            "requires_approval": t["requires_approval"],
+            "inputs_schema": t["inputs_schema"],
+            "asset_types": t.get("asset_types", []),
+        }
+        for t in tools
+    ]
+
+    schema_for_call = build_plan_schema_with_tool_enum(tools)
+
+    prompt_obj = {
         "anomaly": anomaly,
         "capabilities": tool_summaries,
-        "guidance": [
-            "Pick tools appropriate for asset types and business impact.",
+        "rules": [
+            "Return ONLY valid JSON that matches the provided JSON schema.",
+            "You MUST pick tool_id values that exist in capabilities[].id.",
+            "Respect constraints.allowed_actions and constraints.forbidden_actions.",
+            "Every step MUST include verify and rollback. If not applicable, use 'N/A'.",
             "Prefer least-disruptive actions first for critical services unless confidence is very high.",
-            "Every disruptive step must include verify and rollback.",
-            "Every step MUST include verify and rollback. If not applicable, use \"N/A\"."
-        ]
+        ],
     }
 
+    t0 = time.perf_counter()
     resp = requests.post(
         _ollama_api_url("/generate"),
         json={
             "model": OLLAMA_CHAT_MODEL,
             "prompt": (
-                "You are a SOAR agent that plans incident response.\n"
-                "You MUST choose tool_id values from the capabilities list.\n"
-                "Use severity, confidence, impact, and asset types to decide.\n"
-                "Return JSON matching the schema.\n\n"
-                f"INPUT:\n{json.dumps(prompt)}\n"
+                "You are an incident response planner (SOAR agent).\n"
+                "Output MUST be JSON only.\n\n"
+                f"INPUT:\n{json.dumps(prompt_obj, ensure_ascii=False)}\n"
             ),
-            "format": PLAN_SCHEMA,   # structured outputs
-            "stream": False
+            "format": schema_for_call,  # structured output schema
+            "stream": False,
         },
-        timeout=180
+        timeout=240,
     )
+    llm_ms = int((time.perf_counter() - t0) * 1000)
+
     if resp.status_code != 200:
         raise RuntimeError(f"Ollama error {resp.status_code}: {resp.text[:1000]}")
     resp.raise_for_status()
-    raw = resp.json().get("response", "")
+
+    body = resp.json()
+    raw = body.get("response", "")
+
+    # Ollama returns `response` as a string; parse it.
     if isinstance(raw, str):
         raw = raw.strip()
-        return json.loads(raw)
-    return raw
+        plan = json.loads(raw)
+        return plan, llm_ms
 
-def plan_selector(anomaly: Dict[str, Any], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # If it ever returns a dict directly, accept it.
+    if isinstance(raw, dict):
+        return raw, llm_ms
+
+    raise RuntimeError(f"Unexpected Ollama response type: {type(raw)}")
+
+
+def plan_selector(anomaly: Dict[str, Any], tools: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], int]:
     if LLM_MODE == "ollama":
         return llm_plan_ollama(anomaly, tools)
     return llm_plan_stub(anomaly, tools)
 
+
 # ---------------- Plan validation / gating ----------------
 def validate_plan(plan: Dict[str, Any], tools: List[Dict[str, Any]]) -> List[str]:
-    errors = []
+    errors: List[str] = []
     try:
         js_validate(plan, PLAN_SCHEMA)
     except ValidationError as e:
         return [f"Plan schema invalid: {e.message}"]
 
     idx = tool_index(tools)
+    allowed = set((plan.get("constraints") or {}).get("allowed_actions", []))  # not always present
+    forbidden = set((plan.get("constraints") or {}).get("forbidden_actions", []))
 
     for step in plan.get("steps", []):
         tid = step.get("tool_id")
@@ -184,21 +255,23 @@ def validate_plan(plan: Dict[str, Any], tools: List[Dict[str, Any]]) -> List[str
             continue
 
         tool = idx[tid]
-        schema = tool.get("inputs_schema")
+        schema = tool.get("inputs_schema") or {"type": "object"}
+
         try:
             js_validate(step.get("inputs", {}), schema)
         except ValidationError as e:
             errors.append(f"Invalid inputs for {tid}: {e.message}")
 
-        # Require verify/rollback for medium+ risk tools (PoC policy)
+        # PoC rule: medium+ risk steps must have verify & rollback
         risk = (tool.get("risk") or "low").lower()
-        if risk in ("medium","high","critical"):
+        if risk in ("medium", "high", "critical"):
             if not step.get("verify"):
                 errors.append(f"{tid} missing verify field")
             if not step.get("rollback"):
                 errors.append(f"{tid} missing rollback field")
 
     return errors
+
 
 # ---------------- OpenC2 templating ----------------
 def render_template(obj: Any, inputs: Dict[str, Any]) -> Any:
@@ -213,122 +286,306 @@ def render_template(obj: Any, inputs: Dict[str, Any]) -> Any:
         return out
     return obj
 
+
 # ---------------- CACAO generation from validated plan ----------------
+import os
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List
+
+def _cacao_ts_z(dt: datetime | None = None) -> str:
+    dt = dt or datetime.now(timezone.utc)
+    # CACAO schema expects ...Z (not +00:00)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _cacao_id(prefix: str) -> str:
+    # prefix must be schema-allowed: http-api, ssh, linux, net-address, etc.
+    return f"{prefix}--{uuid.uuid4()}"
+
 def generate_cacao_from_plan(anomaly: Dict[str, Any], plan: Dict[str, Any], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
     idx = tool_index(tools)
-    pb_id = str(uuid.uuid4())
-    start_id = "start--1"
-    end_id = "end--1"
 
-    steps = plan["steps"]
-    workflow = {
-        start_id: {"id": start_id, "type": "start", "on_completion": steps[0]["step_id"] if steps else end_id},
-        end_id: {"id": end_id, "type": "end"}
+    pb_id = f"playbook--{uuid.uuid4()}"
+    created_by = f"identity--{uuid.uuid4()}"
+    now_z = _cacao_ts_z()
+
+    start_id = f"start--{uuid.uuid4()}"
+    end_id = f"end--{uuid.uuid4()}"
+
+    # ---- Agent definition (must match CACAO patternProperties) ----
+    # IMPORTANT: do NOT use agent-- prefix; schema wants http-api-- / ssh-- / etc.
+    agent_id = _cacao_id("http-api")
+    executor_url = os.getenv("EXECUTOR_BASE_URL", "http://executor.stub:8000")
+
+    # Your schema says address must be an OBJECT, not a string.
+    agent_obj = {
+        "id": agent_id,
+        "type": "http-api",
+        "name": "poc-soar-agent",
+        "description": "PoC execution agent (stub/executor over HTTP).",
+        "address": {
+            "url": [executor_url]
+        },
+    }
+
+    # ---- Target definitions ----
+    entities = anomaly.get("entities") or {}
+    hosts = entities.get("hosts") or []
+    ips = entities.get("ips") or []
+
+    target_defs: Dict[str, Any] = {}
+    target_ids: List[str] = []
+
+    # Hosts -> linux targets
+    for h in hosts:
+        tid = _cacao_id("linux")
+        target_defs[tid] = {
+            "id": tid,
+            "type": "linux",
+            "name": h,
+            "description": "Host extracted from anomaly entities.",
+            "address": {"hostname": h},  # address must be object
+        }
+        target_ids.append(tid)
+
+    # IPs -> net-address targets
+    for ip in ips:
+        tid = _cacao_id("net-address")
+        target_defs[tid] = {
+            "id": tid,
+            "type": "net-address",
+            "name": ip,
+            "description": "IP extracted from anomaly entities.",
+            "address": {"ipv4": ip},  # address must be object
+        }
+        target_ids.append(tid)
+
+    # If no targets at all, create one dummy to satisfy minProperties:1 (if target_definitions is present)
+    if not target_defs:
+        dummy_id = _cacao_id("linux")
+        target_defs[dummy_id] = {
+            "id": dummy_id,
+            "type": "linux",
+            "name": "unknown",
+            "description": "No targets provided by anomaly.",
+            "address": {"hostname": "unknown"},  # object, not string
+        }
+        target_ids.append(dummy_id)
+
+    # ---- Workflow ----
+    steps = plan.get("steps") or []
+
+    # Map internal plan step_id -> CACAO action UUID ids
+    step_map: Dict[str, str] = {}
+    for s in steps:
+        sid = s.get("step_id") or f"s-{uuid.uuid4().hex[:6]}"
+        step_map[sid] = f"action--{uuid.uuid4()}"
+
+    workflow: Dict[str, Any] = {
+        start_id: {
+            "id": start_id,
+            "type": "start",
+            "on_completion": (step_map[steps[0]["step_id"]] if steps else end_id),
+        },
+        end_id: {"id": end_id, "type": "end"},
     }
 
     for i, s in enumerate(steps):
-        tid = s["tool_id"]
-        tool = idx[tid]
+        sid = s["step_id"]
+        action_id = step_map[sid]
+
+        tool = idx[s["tool_id"]]
         openc2 = render_template(tool["openc2_template"], s.get("inputs", {}))
 
-        next_step = steps[i + 1]["step_id"] if i < len(steps) - 1 else end_id
-        workflow[s["step_id"]] = {
-            "id": s["step_id"],
+        next_id = step_map[steps[i + 1]["step_id"]] if i < len(steps) - 1 else end_id
+
+        action_obj: Dict[str, Any] = {
+            "id": action_id,
             "type": "action",
             "name": tool["name"],
             "description": f"{tool['description']} | why: {s.get('why')}",
-            "openc2": openc2,
-            "on_completion": next_step
+            "agent": agent_id,
+            "commands": [{"type": "openc2", "command": openc2}],
+            "on_completion": next_id,
         }
 
-    return {
+        # Targets are optional; if included must reference target_definitions keys
+        if target_ids:
+            action_obj["targets"] = target_ids
+
+        workflow[action_id] = action_obj
+
+    # ---- Playbook root ----
+    playbook: Dict[str, Any] = {
         "type": "playbook",
         "spec_version": "cacao-2.0",
-        "id": f"playbook--{pb_id}",
+        "id": pb_id,
         "name": f"Auto-playbook: {anomaly['signal']['type']} {anomaly['signal']['summary'][:80]}",
-        "description": "Generated draft from LLM plan + tool registry (PoC).",
+        "description": (
+            f"LLM-generated CACAO draft (model={OLLAMA_CHAT_MODEL}) for anomaly "
+            f"{anomaly.get('anomaly_id','n/a')} [{anomaly['signal']['type']}|{anomaly['signal'].get('severity','n/a')}]. "
+            f"Objective={plan.get('objective','n/a')}. Env={anomaly.get('environment','n/a')}. "
+            f"Approval={((anomaly.get('constraints') or {}).get('requires_human_approval'))}."
+        ),
+        "created": now_z,
+        "modified": now_z,
+        "created_by": created_by,
         "workflow_start": start_id,
         "workflow": workflow,
+
+        # MUST be objects keyed by valid CACAO identifiers (patternProperties)
+        "agent_definitions": {agent_id: agent_obj},
+        "target_definitions": target_defs,
     }
 
+    return playbook
+
 # ---------------- Persistence ----------------
-def persist_case(anomaly: Dict[str, Any], plan: Dict[str, Any], cacao: Dict[str, Any], validation: Dict[str, Any]) -> str:
+def persist_case(
+    anomaly: Dict[str, Any],
+    plan: Dict[str, Any],
+    cacao: Dict[str, Any],
+    validation: Dict[str, Any],
+    status: str = "DRAFT_READY",
+) -> str:
     case_id = str(uuid.uuid4())
     params = {
         "id": case_id,
-        "status": "DRAFT_READY",
+        "status": status,
         "anomaly": json.dumps(anomaly),
         "strategy": json.dumps(plan),
         "cacao": json.dumps(cacao),
         "validation": json.dumps(validation),
     }
     with db.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO cases (id, status, anomaly, strategy, cacao_draft, validation)
-            VALUES (:id, :status,
-                    CAST(:anomaly AS jsonb),
-                    CAST(:strategy AS jsonb),
-                    CAST(:cacao AS jsonb),
-                    CAST(:validation AS jsonb))
-        """), params)
+        conn.execute(
+            text(
+                """
+                INSERT INTO cases (id, status, anomaly, strategy, cacao_draft, validation)
+                VALUES (:id, :status,
+                        CAST(:anomaly AS jsonb),
+                        CAST(:strategy AS jsonb),
+                        CAST(:cacao AS jsonb),
+                        CAST(:validation AS jsonb))
+                """
+            ),
+            params,
+        )
         conn.execute(text("INSERT INTO approvals (case_id, status) VALUES (:id, 'PENDING')"), {"id": case_id})
     return case_id
 
+
 # ---------------- Notifications ----------------
-def notify(kind: str, payload: Dict[str, Any]):
+def notify(kind: str, payload: Dict[str, Any]) -> None:
     try:
-        r.xadd(STREAM_NOTIFICATIONS, {"kind": kind, "json": json.dumps(payload)},
-               maxlen=MAX_STREAM_LEN, approximate=True)
+        r.xadd(
+            STREAM_NOTIFICATIONS,
+            {"kind": kind, "json": json.dumps(payload)},
+            maxlen=MAX_STREAM_LEN,
+            approximate=True,
+        )
     except Exception:
         log.exception("Failed to notify kind=%s", kind)
 
+
 # ---------------- Streams worker ----------------
-def ensure_group(stream: str, group: str):
+def ensure_group(stream: str, group: str) -> None:
     try:
         r.xgroup_create(stream, group, id="0-0", mkstream=True)
     except Exception:
+        # group exists or stream exists
         pass
 
-def worker_loop():
+
+def worker_loop() -> None:
     ensure_group(STREAM_IN, CONSUMER_GROUP)
     log.info("Worker started. stream=%s group=%s consumer=%s", STREAM_IN, CONSUMER_GROUP, CONSUMER_NAME)
 
     while True:
-        msgs = r.xreadgroup(CONSUMER_GROUP, CONSUMER_NAME, {STREAM_IN: ">"}, count=1, block=BLOCK_MS)
+        msgs = r.xreadgroup(
+            CONSUMER_GROUP,
+            CONSUMER_NAME,
+            {STREAM_IN: ">"},
+            count=1,
+            block=BLOCK_MS,
+        )
         if not msgs:
             continue
 
         _, entries = msgs[0]
         msg_id, fields = entries[0]
 
+        log.info("Processing msg_id=%s", msg_id)
+
         try:
             anomaly = json.loads(fields["json"])
             notify("anomaly_received", {"anomaly_id": anomaly.get("anomaly_id"), "env": anomaly.get("environment")})
 
             env = anomaly.get("environment", "prod")
-            assets = anomaly.get("assets", [])
-            tools = load_tools(env, assets)
+            assets = anomaly.get("assets", [])  # ok if absent
 
-            plan = plan_selector(anomaly, tools)
+            tools = load_tools(env, assets)
+            log.info("Loaded tools: %d", len(tools))
+
+            # ---- Plan generation (LLM) ----
+            plan, llm_ms = plan_selector(anomaly, tools)
+            log.info("Generated plan")
+
+            # ---- Plan validation ----
             plan_errors = validate_plan(plan, tools)
 
-            cacao = generate_cacao_from_plan(anomaly, plan, tools) if not plan_errors else {}
-            schema_errors = validate_cacao(cacao) if cacao else ["CACAO not generated due to plan errors"]
+            # ---- CACAO generation + validation (best-effort) ----
+            cacao: Dict[str, Any] = {}
+            schema_errors: List[str] = []
 
-            validation = {
-                "plan_errors": plan_errors,
-                "schema_errors": schema_errors,
-                "tool_count": len(tools)
+            if not plan_errors:
+                cacao = generate_cacao_from_plan(anomaly, plan, tools)
+                # validate CACAO, but DO NOT gate persistence on schema errors in PoC
+                schema_errors = validate_cacao(cacao)
+
+            else:
+                schema_errors = ["CACAO not generated due to plan errors"]
+
+            # ---- Timing ----
+            now_ms = int(time.time() * 1000)
+            ingest_ms = int(anomaly.get("ingested_at_ms", now_ms))
+            timing = {
+                "ingested_at": anomaly.get("ingested_at"),
+                "ingested_at_ms": ingest_ms,
+                "plan_generated_at": utc_now_iso(),
+                "mttr_ms": now_ms - ingest_ms,
+                "llm_ms": llm_ms,
             }
 
+            # ---- Validation report ----
+            validation: Dict[str, Any] = {
+                "plan_errors": plan_errors,
+                "schema_errors": schema_errors,
+                "tool_count": len(tools),
+                "timing": timing,
+            }
+
+            log.info("Plan errors: %d | CACAO schema errors: %d", len(plan_errors), len(schema_errors))
+
+            # ---- Fatal only if plan invalid ----
             if plan_errors:
-                # dead-letter + ack poison pill (PoC choice)
-                r.xadd(STREAM_OUT_ERRORS, {"msg_id": msg_id, "error": json.dumps(validation), "payload": fields["json"][:8000]},
-                       maxlen=MAX_STREAM_LEN, approximate=True)
+                r.xadd(
+                    STREAM_OUT_ERRORS,
+                    {"msg_id": msg_id, "error": json.dumps(validation), "payload": fields["json"][:8000]},
+                    maxlen=MAX_STREAM_LEN,
+                    approximate=True,
+                )
                 r.xack(STREAM_IN, CONSUMER_GROUP, msg_id)
                 continue
 
-            case_id = persist_case(anomaly, plan, cacao, validation)
+            # ---- Persist always (even if CACAO invalid) ----
+            status = "DRAFT_READY" if not schema_errors else "DRAFT_INVALID_CACAO"
+            log.info("Persisting case (status=%s)...", status)
+
+            case_id = persist_case(anomaly, plan, cacao, validation, status=status)
+
+            log.info("Persisted case_id=%s", case_id)
+
             r.xadd(STREAM_OUT_READY, {"case_id": case_id}, maxlen=MAX_STREAM_LEN, approximate=True)
             notify("case_created", {"case_id": case_id, "anomaly_id": anomaly.get("anomaly_id")})
 
@@ -337,10 +594,15 @@ def worker_loop():
 
         except Exception as e:
             log.exception("Failed processing msg_id=%s", msg_id)
-            r.xadd(STREAM_OUT_ERRORS, {"msg_id": msg_id, "error": repr(e), "payload": fields.get("json","")[:8000]},
-                   maxlen=MAX_STREAM_LEN, approximate=True)
+            r.xadd(
+                STREAM_OUT_ERRORS,
+                {"msg_id": msg_id, "error": repr(e), "payload": fields.get("json", "")[:8000]},
+                maxlen=MAX_STREAM_LEN,
+                approximate=True,
+            )
             r.xack(STREAM_IN, CONSUMER_GROUP, msg_id)
             time.sleep(0.25)
+
 
 if __name__ == "__main__":
     worker_loop()

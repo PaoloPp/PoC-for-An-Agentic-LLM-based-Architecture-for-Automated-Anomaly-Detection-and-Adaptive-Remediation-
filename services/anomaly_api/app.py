@@ -1,8 +1,9 @@
 from fastapi import FastAPI
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List
+import time
 import redis
 import os, json, uuid
 
@@ -34,6 +35,8 @@ class ConfirmedAnomaly(BaseModel):
 def post_confirmed_anomaly(a: ConfirmedAnomaly):
     # Convert datetimes (and other non-JSON types) to JSON-compatible types
     payload = jsonable_encoder(a)  # <- key fix
+    payload["ingested_at"] = datetime.now(timezone.utc).isoformat()
+    payload["ingested_at_ms"] = int(time.time() * 1000)
     r.xadd(
         "confirmed_anomalies",
         {"json": json.dumps(payload)},
