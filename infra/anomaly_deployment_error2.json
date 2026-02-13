@@ -1,0 +1,69 @@
+{
+  "anomaly_id": "a-app-2020",
+  "timestamp": "2026-02-05T13:22:00Z",
+  "resource_group": "rg-prod-payments",
+  "environment": "prod",
+  "signal": {
+    "type": "availability",
+    "summary": "p95 latency + error rate spiked immediately after release v2.7.3 (probable regression / config drift)",
+    "severity": "high",
+    "confidence": 0.84
+  },
+  "entities": {
+    "apps": [
+      "payments-api"
+    ],
+    "services": [
+      "payments-api"
+    ],
+    "namespaces": [
+      "prod"
+    ],
+    "hosts": [
+      "pay-api-01"
+    ]
+  },
+  "evidence": [
+    {
+      "source": "metrics",
+      "ref": "grafana_panel_32",
+      "details": {
+        "release_version": "v2.7.3",
+        "prev_version": "v2.7.2",
+        "p95_ms": 1850,
+        "http_5xx_pct": 7.4,
+        "started_minutes_ago": 6
+      }
+    }
+  ],
+  "constraints": {
+    "requires_human_approval": true,
+    "allowed_actions": [
+      "collect_triage",
+      "rollback_release"
+    ],
+    "forbidden_actions": [
+      "disable_user",
+      "isolate_host",
+      "block_ip",
+      "block_domain",
+      "wipe_host",
+      "delete_data"
+    ]
+  },
+  "assets": [
+    {
+      "asset_type": "k8s",
+      "name": "payments-api",
+      "namespace": "prod"
+    },
+    {
+      "asset_type": "app",
+      "name": "payments-api"
+    },
+    {
+      "asset_type": "server",
+      "name": "pay-api-01"
+    }
+  ]
+}

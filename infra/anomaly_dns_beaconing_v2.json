@@ -1,0 +1,36 @@
+{
+  "anomaly_id": "a-net-1010",
+  "timestamp": "2026-02-05T13:10:00Z",
+  "resource_group": "rg-staging-web",
+  "environment": "staging",
+  "signal": {
+    "type": "network",
+    "summary": "High-entropy subdomain bursts + periodic HTTPS beacons to suspicious domain (possible DNS tunneling / C2)",
+    "severity": "medium",
+    "confidence": 0.78
+  },
+  "entities": {
+    "hosts": ["web-stg-02"],
+    "ips": ["192.0.2.55"],
+    "domains": ["telemetry-sync.example-bad.tld"],
+    "file_hashes": ["7d3f2b1c8b5b2a9e1c7a9e6b2c1d4f8a6e9c1a0b3d2e1f4a5b6c7d8e9f0a1b2"]
+  },
+  "evidence": [
+    {
+      "source": "ndr",
+      "ref": "flowset_99110",
+      "details": {
+        "dns_qps": 3.2,
+        "unique_subdomains_last_10m": 1200,
+        "beacon_interval_seconds_mode": 60,
+        "outbound_ports": [443],
+        "tls_sni": "telemetry-sync.example-bad.tld"
+      }
+    }
+  ],
+  "constraints": {
+    "requires_human_approval": false,
+    "allowed_actions": ["collect_triage", "block_domain", "isolate_host", "quarantine_hash"],
+    "forbidden_actions": ["wipe_host", "delete_data"]
+  }
+}
