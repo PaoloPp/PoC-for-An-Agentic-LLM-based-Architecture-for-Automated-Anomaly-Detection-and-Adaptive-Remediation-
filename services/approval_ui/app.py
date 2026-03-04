@@ -18,12 +18,10 @@ def _engine() -> Engine:
     if not DATABASE_URL:
         st.error("DATABASE_URL env var is missing.")
         st.stop()
-    # pool_pre_ping helps survive container/network hiccups
     return create_engine(DATABASE_URL, pool_pre_ping=True)
 
 
 def _to_jsonable(v: Any) -> Any:
-    """Make DB-returned values safe/pretty for st.json()."""
     if v is None:
         return None
     if isinstance(v, (dict, list, int, float, bool)):
@@ -36,7 +34,6 @@ def _to_jsonable(v: Any) -> Any:
         except Exception:
             return str(v)
     if isinstance(v, str):
-        # if it's JSON-as-string, parse it
         s = v.strip()
         if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
             try:
@@ -47,7 +44,7 @@ def _to_jsonable(v: Any) -> Any:
     return str(v)
 
 
-def _get_nested(d, path, default=None):
+def _get_nested(d: Any, path: list, default=None):
     cur = d
     for k in path:
         if not isinstance(cur, dict) or k not in cur:
@@ -102,7 +99,6 @@ def case_label(c: Dict[str, Any]) -> str:
             anomaly = json.loads(anomaly)
         except Exception:
             anomaly = {}
-
     signal = (anomaly or {}).get("signal") or {}
     summary = signal.get("summary") or "no summary"
     severity = signal.get("severity") or "n/a"
@@ -143,37 +139,29 @@ if case is None:
     st.warning("Case not found (it may have been deleted or not committed).")
     st.stop()
 
-# ---- Timing extraction (MTTR + LLM) ----
-validation_obj = _to_jsonable(case.get("validation")) or {}
-if isinstance(validation_obj, str):
-    # extremely defensive, _to_jsonable should already parse JSON strings
+validation = _to_jsonable(case.get("validation")) or {}
+if isinstance(validation, str):
     try:
-        validation_obj = json.loads(validation_obj)
+        validation = json.loads(validation)
     except Exception:
-        validation_obj = {}
+        validation = {}
 
-timing = _get_nested(validation_obj, ["timing"], default={}) or {}
-mttr_ms = timing.get("mttr_ms")
-llm_ms = timing.get("llm_ms")
-ingested_at = timing.get("ingested_at")
-plan_generated_at = timing.get("plan_generated_at")
+timing = _get_nested(validation, ["timing"], {}) or {}
+quality = _get_nested(validation, ["quality"], {}) or {}
 
-# Header info (now includes MTTR)
-meta1, meta2, meta3, meta4 = st.columns([1, 1, 1, 2])
-with meta1:
+# Header metrics
+m1, m2, m3, m4, m5 = st.columns([1, 1, 1, 1, 1])
+with m1:
     st.metric("Status", str(case.get("status", "UNKNOWN")))
-with meta2:
-    st.metric("Case ID", case_id)
-with meta3:
-    st.metric("MTTR (POST → plan ready)", _fmt_ms(mttr_ms))
-with meta4:
-    st.metric("LLM time", _fmt_ms(llm_ms))
+with m2:
+    st.metric("Case ID", case_id[:8])
+with m3:
+    st.metric("MTTR", _fmt_ms(timing.get("mttr_ms")))
+with m4:
+    st.metric("LLM time", _fmt_ms(timing.get("llm_ms")))
+with m5:
+    st.metric("PQS", str(quality.get("pqs_total", "N/A")))
 
-# Optional timestamps (useful for screenshots/paper)
-if ingested_at or plan_generated_at:
-    st.caption(f"Ingested: {ingested_at or 'N/A'} · Plan generated: {plan_generated_at or 'N/A'}")
-
-# Main content
 left, right = st.columns([1, 1])
 
 with left:
@@ -187,9 +175,12 @@ with right:
     st.subheader("CACAO draft")
     st.json(_to_jsonable(case.get("cacao_draft")), expanded=1)
 
-    st.subheader("Validation")
+    st.subheader("Validation + Metrics")
     st.json(_to_jsonable(case.get("validation")), expanded=2)
 
-# Optional raw dump for debugging
+    if isinstance(quality, dict) and quality:
+        st.subheader("Quality Breakdown")
+        st.json(quality, expanded=2)
+
 with st.expander("Raw case record"):
     st.json({k: _to_jsonable(v) for k, v in case.items()}, expanded=1)

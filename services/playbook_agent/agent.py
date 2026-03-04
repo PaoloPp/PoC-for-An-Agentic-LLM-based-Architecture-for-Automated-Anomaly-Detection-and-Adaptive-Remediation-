@@ -4,7 +4,7 @@ import uuid
 import time
 import logging
 from copy import deepcopy
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -23,6 +23,11 @@ LLM_MODE = os.getenv("LLM_MODE", "stub").lower()  # "stub" or "ollama"
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.1:8b")
+OLLAMA_CHAT_MODEL_DEFAULT = os.getenv("OLLAMA_CHAT_MODEL_DEFAULT", "llama3.1:8b")
+
+def get_chat_model() -> str:
+    # Always resolve at call time (cleaner, avoids surprises)
+    return os.getenv("OLLAMA_CHAT_MODEL", "") or OLLAMA_CHAT_MODEL_DEFAULT
 
 STREAM_IN = os.getenv("STREAM_IN", "confirmed_anomalies")
 STREAM_OUT_READY = os.getenv("STREAM_OUT_READY", "playbook_ready")
@@ -41,9 +46,12 @@ CACAO_SCHEMA_PATH = os.getenv("CACAO_SCHEMA_PATH", "schemas/playbook.json")
 
 PLAN_SCHEMA_PATH = os.getenv("PLAN_SCHEMA_PATH", "schemas/plan.schema.json")
 
-# Idempotency behavior
-IDEMP_TTL_SEC = int(os.getenv("IDEMP_TTL_SEC", str(7 * 24 * 3600)))   # 7 days for processed
-INPROGRESS_TTL_SEC = int(os.getenv("INPROGRESS_TTL_SEC", "900"))      # 15 minutes for in-progress
+# Executor URL must satisfy schema regex (needs a dot in hostname)
+EXECUTOR_BASE_URL = os.getenv("EXECUTOR_BASE_URL", "http://executor.stub:8000")
+
+# Idempotency (avoid duplicates on Redis replays)
+IDEMP_TTL_SEC = int(os.getenv("IDEMP_TTL_SEC", str(7 * 24 * 3600)))  # 7 days
+INPROGRESS_TTL_SEC = int(os.getenv("INPROGRESS_TTL_SEC", "900"))      # 15 minutes
 
 
 # ---------------- Logging ----------------
@@ -66,6 +74,10 @@ def _register_pgvector(dbapi_connection, connection_record):
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def utc_now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 def _ollama_api_url(path: str) -> str:
@@ -93,9 +105,69 @@ def validate_cacao(playbook: Dict[str, Any]) -> List[str]:
     return [f"{list(e.path)}: {e.message}" for e in errors]
 
 
+# ---------------- Utility: tool/action mapping ----------------
+def _tool_to_action_name(tool_id: str) -> str:
+    # convention: "category.action" -> "action"
+    if not tool_id:
+        return ""
+    return tool_id.split(".", 1)[-1].strip().lower()
+
+
+# ---------------- Asset type normalization & inference ----------------
+ALIASES = {
+    "kubernetes": "k8s",
+    "k8": "k8s",
+    "k8s": "k8s",
+    "namespace": "k8s",
+    "pod": "k8s",
+    "cluster": "k8s",
+    "application": "app",
+    "service": "app",
+    "host": "server",
+    "machine": "server",
+    "identity": "iam",
+}
+
+def norm_asset_type(x: str) -> str:
+    x = (x or "").strip().lower()
+    return ALIASES.get(x, x)
+
+def infer_assets_from_entities(anomaly: Dict[str, Any]) -> List[Dict[str, Any]]:
+    entities = (anomaly or {}).get("entities") or {}
+    inferred: List[Dict[str, Any]] = []
+
+    for h in (entities.get("hosts") or []):
+        inferred.append({"asset_type": "server", "name": h})
+
+    if (entities.get("namespaces") or []) or (entities.get("services") or []):
+        inferred.append({"asset_type": "k8s", "name": (entities.get("services") or ["unknown"])[0]})
+
+    for app in (entities.get("apps") or []):
+        inferred.append({"asset_type": "app", "name": app})
+
+    if (entities.get("ips") or []) or (entities.get("domains") or []):
+        inferred.append({"asset_type": "network", "name": "network-indicators"})
+
+    if (entities.get("users") or []) or (entities.get("usernames") or []):
+        inferred.append({"asset_type": "iam", "name": "identity"})
+
+    # de-dup
+    seen = set()
+    out = []
+    for a in inferred:
+        at = norm_asset_type(a.get("asset_type", ""))
+        nm = a.get("name")
+        key = (at, nm)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"asset_type": at, "name": nm, **{k: v for k, v in a.items() if k not in ("asset_type", "name")}})
+    return out
+
+
 # ---------------- Tool registry ----------------
 def load_tools(environment: str, assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    asset_types = sorted({a.get("asset_type", "server") for a in (assets or [])})
+    asset_types = sorted({norm_asset_type(a.get("asset_type")) for a in (assets or []) if a.get("asset_type")})
     with db.begin() as conn:
         rows = conn.execute(
             text(
@@ -110,10 +182,16 @@ def load_tools(environment: str, assets: List[Dict[str, Any]]) -> List[Dict[str,
         ).mappings().all()
 
     tools = [dict(r) for r in rows]
+    pre = len(tools)
 
-    # Filter down to relevant asset types
+    # Filter only if we actually have asset_types
     if asset_types:
-        tools = [t for t in tools if any(at in (t.get("asset_types") or []) for at in asset_types)]
+        tools = [
+            t for t in tools
+            if any(norm_asset_type(at) in asset_types for at in (t.get("asset_types") or []))
+        ]
+
+    log.info("Loaded tools: %d (pre-filter=%d) asset_types=%s", len(tools), pre, asset_types)
     return tools
 
 
@@ -121,42 +199,31 @@ def tool_index(tools: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {t["id"]: t for t in tools}
 
 
-def _tool_to_action_name(tool_id: str) -> str:
-    # "edr.isolate_host" -> "isolate_host"
-    if not tool_id:
-        return ""
-    return tool_id.split(".", 1)[-1].strip().lower()
-
-
 def filter_tools_by_constraints(tools: List[Dict[str, Any]], anomaly: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    HARD filter before the LLM sees the tool catalogue.
-    - If allowed_actions is non-empty => whitelist mode
-    - Always remove forbidden_actions
+    Hard filter tools BEFORE LLM sees them.
+    - If allowed_actions is non-empty: whitelist mode (keep only allowed actions)
+    - Always remove forbidden actions
     """
     constraints = (anomaly or {}).get("constraints") or {}
     allowed = [a.lower() for a in (constraints.get("allowed_actions") or [])]
     forbidden = set(a.lower() for a in (constraints.get("forbidden_actions") or []))
-    whitelist_mode = len(allowed) > 0
+    whitelist = len(allowed) > 0
 
-    filtered: List[Dict[str, Any]] = []
+    out = []
     for t in tools:
         tid = (t.get("id") or "").strip()
         action = _tool_to_action_name(tid)
-
         if action in forbidden:
             continue
-        if whitelist_mode and action not in allowed:
+        if whitelist and action not in allowed:
             continue
-
-        filtered.append(t)
-
-    return filtered
+        out.append(t)
+    return out
 
 
 def enforce_constraints(plan: Dict[str, Any], anomaly: Dict[str, Any], tools: List[Dict[str, Any]]) -> List[str]:
     errors: List[str] = []
-
     constraints = (anomaly or {}).get("constraints") or {}
     allowed = [a.lower() for a in (constraints.get("allowed_actions") or [])]
     forbidden = [a.lower() for a in (constraints.get("forbidden_actions") or [])]
@@ -169,13 +236,11 @@ def enforce_constraints(plan: Dict[str, Any], anomaly: Dict[str, Any], tools: Li
         if tid not in idx:
             continue
 
-        action_name = _tool_to_action_name(tid)
-
-        if action_name in forbidden:
-            errors.append(f"Forbidden action '{action_name}' used by tool_id '{tid}'")
-
-        if whitelist_mode and action_name not in allowed:
-            errors.append(f"Action '{action_name}' (tool_id '{tid}') not in allowed_actions={allowed}")
+        action = _tool_to_action_name(tid)
+        if action in forbidden:
+            errors.append(f"Forbidden action '{action}' used by tool_id '{tid}'")
+        if whitelist_mode and action not in allowed:
+            errors.append(f"Action '{action}' (tool_id '{tid}') not in allowed_actions={allowed}")
 
     return errors
 
@@ -185,9 +250,6 @@ PLAN_SCHEMA: Dict[str, Any] = json.loads(Path(PLAN_SCHEMA_PATH).read_text())
 
 
 def build_plan_schema_with_tool_enum(tools: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Constrain tool_id to only valid tool IDs so the model can't invent 'unknown'.
-    """
     schema = deepcopy(PLAN_SCHEMA)
     tool_ids = [t["id"] for t in tools if "id" in t]
     try:
@@ -200,24 +262,35 @@ def build_plan_schema_with_tool_enum(tools: List[Dict[str, Any]]) -> Dict[str, A
 # ---------------- Deterministic fallback plan ----------------
 def build_deterministic_triage_plan(anomaly: Dict[str, Any], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Safe fallback: if there is a collect_triage tool, use it.
-    Otherwise: return an investigate plan with zero steps (safe no-op).
+    Safe fallback:
+    - if 'soar.collect_triage' exists, use it
+    - else return an investigate plan with empty steps (must be allowed by your schema)
     """
-    triage_tool_id = None
+    triage_id = None
     for t in tools:
-        tid = t.get("id")
-        if _tool_to_action_name(tid) == "collect_triage" or tid == "soar.collect_triage":
-            triage_tool_id = tid
+        tid = t.get("id", "")
+        if tid == "soar.collect_triage" or _tool_to_action_name(tid) == "collect_triage":
+            triage_id = tid
             break
 
-    if triage_tool_id:
+    if triage_id:
+        host = None
+        entities = (anomaly.get("entities") or {})
+        if entities.get("hosts"):
+            host = entities["hosts"][0]
+
+        inputs = {}
+        if host:
+            # your tool schema requires host_id, so provide it if possible
+            inputs = {"host_id": host, "window_minutes": 30, "include": ["logs", "metrics", "processes", "network"]}
+
         return {
             "objective": "investigate",
             "steps": [
                 {
                     "step_id": "s-triage-0001",
-                    "tool_id": triage_tool_id,
-                    "inputs": {},
+                    "tool_id": triage_id,
+                    "inputs": inputs,
                     "why": "Deterministic fallback: collect triage only (safe default).",
                     "verify": "Review collected artifacts/telemetry.",
                     "rollback": "N/A",
@@ -227,24 +300,28 @@ def build_deterministic_triage_plan(anomaly: Dict[str, Any], tools: List[Dict[st
             "risk_notes": ["Fallback mode (triage-only)."],
         }
 
-    # If no triage tool exists, safest is to do nothing rather than hallucinate actions.
     return {
         "objective": "investigate",
         "steps": [],
         "confidence": 0.05,
-        "risk_notes": ["Fallback mode: no permitted tools available under constraints."],
+        "risk_notes": ["Fallback: no permitted tools available under constraints."],
     }
 
 
 # ---------------- LLM Plan ----------------
 def llm_plan_stub(anomaly: Dict[str, Any], tools: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], int]:
-    start = time.perf_counter()
+    t0 = time.perf_counter()
     plan = build_deterministic_triage_plan(anomaly, tools)
-    ms = int((time.perf_counter() - start) * 1000)
-    return plan, ms
+    return plan, int((time.perf_counter() - t0) * 1000)
 
 
 def llm_plan_ollama(anomaly: Dict[str, Any], tools: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], int]:
+    if not tools:
+        # Never call the LLM if nothing is allowed
+        t0 = time.perf_counter()
+        plan = build_deterministic_triage_plan(anomaly, tools)
+        return plan, int((time.perf_counter() - t0) * 1000)
+
     tool_summaries = [
         {
             "id": t["id"],
@@ -263,6 +340,15 @@ def llm_plan_ollama(anomaly: Dict[str, Any], tools: List[Dict[str, Any]]) -> Tup
     prompt_obj = {
         "anomaly": anomaly,
         "capabilities": tool_summaries,
+        # "rules": [
+        #     "Return ONLY valid JSON that matches the provided JSON schema.",
+        #     "You MUST pick tool_id values that exist in capabilities[].id.",
+        #     "You MUST respect constraints.allowed_actions and constraints.forbidden_actions.",
+        #     "If allowed_actions is non-empty, you MUST ONLY use those actions.",
+        #     "Every step MUST include verify and rollback. If not applicable, use 'N/A'.",
+        #     "Prefer least-disruptive actions first unless evidence strongly indicates rollback is required.",
+        #     "If rollback_release is allowed and evidence includes release_version and prev_version and started_minutes_ago is small, include rollback_release (after triage).",
+        # ],
         "rules": [
             "Return ONLY valid JSON that matches the provided JSON schema.",
             "You MUST pick tool_id values that exist in capabilities[].id.",
@@ -282,7 +368,7 @@ def llm_plan_ollama(anomaly: Dict[str, Any], tools: List[Dict[str, Any]]) -> Tup
     resp = requests.post(
         _ollama_api_url("/generate"),
         json={
-            "model": OLLAMA_CHAT_MODEL,
+            "model": get_chat_model(),
             "prompt": (
                 "You are an incident response planner (SOAR agent).\n"
                 "Output MUST be JSON only.\n\n"
@@ -304,8 +390,12 @@ def llm_plan_ollama(anomaly: Dict[str, Any], tools: List[Dict[str, Any]]) -> Tup
 
     if isinstance(raw, str):
         raw = raw.strip()
-        plan = json.loads(raw)
-        return plan, llm_ms
+        if not raw:
+            raise RuntimeError("Ollama returned empty response")
+        try:
+            return json.loads(raw), llm_ms
+        except json.JSONDecodeError:
+            raise RuntimeError(f"Ollama returned non-JSON response: {raw[:300]!r}")
 
     if isinstance(raw, dict):
         return raw, llm_ms
@@ -314,19 +404,25 @@ def llm_plan_ollama(anomaly: Dict[str, Any], tools: List[Dict[str, Any]]) -> Tup
 
 
 def plan_selector(anomaly: Dict[str, Any], tools: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], int]:
+    if not tools:
+        # Short-circuit: no allowed tools
+        t0 = time.perf_counter()
+        plan = build_deterministic_triage_plan(anomaly, tools)
+        return plan, int((time.perf_counter() - t0) * 1000)
+
     if LLM_MODE == "ollama":
         return llm_plan_ollama(anomaly, tools)
     return llm_plan_stub(anomaly, tools)
 
 
-# ---------------- Plan validation / gating ----------------
+# ---------------- Plan validation ----------------
 def validate_plan(plan: Dict[str, Any], tools: List[Dict[str, Any]]) -> List[str]:
-    errors: List[str] = []
     try:
         js_validate(plan, PLAN_SCHEMA)
     except ValidationError as e:
         return [f"Plan schema invalid: {e.message}"]
 
+    errors: List[str] = []
     idx = tool_index(tools)
 
     for step in plan.get("steps", []):
@@ -367,15 +463,13 @@ def render_template(obj: Any, inputs: Dict[str, Any]) -> Any:
     return obj
 
 
-# ---------------- CACAO generation from validated plan ----------------
-def _cacao_ts_z(dt: datetime | None = None) -> str:
+# ---------------- CACAO generation ----------------
+def _cacao_ts_z(dt: Optional[datetime] = None) -> str:
     dt = dt or datetime.now(timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-
 def _cacao_id(prefix: str) -> str:
     return f"{prefix}--{uuid.uuid4()}"
-
 
 def generate_cacao_from_plan(anomaly: Dict[str, Any], plan: Dict[str, Any], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
     idx = tool_index(tools)
@@ -387,15 +481,14 @@ def generate_cacao_from_plan(anomaly: Dict[str, Any], plan: Dict[str, Any], tool
     start_id = f"start--{uuid.uuid4()}"
     end_id = f"end--{uuid.uuid4()}"
 
+    # agent definition must match schema patternProperties -> http-api--UUID
     agent_id = _cacao_id("http-api")
-    executor_url = os.getenv("EXECUTOR_BASE_URL", "http://executor.stub:8000")
-
     agent_obj = {
         "id": agent_id,
         "type": "http-api",
         "name": "poc-soar-agent",
         "description": "PoC execution agent (stub/executor over HTTP).",
-        "address": {"url": [executor_url]},
+        "address": {"url": [EXECUTOR_BASE_URL]},
     }
 
     entities = anomaly.get("entities") or {}
@@ -468,7 +561,6 @@ def generate_cacao_from_plan(anomaly: Dict[str, Any], plan: Dict[str, Any], tool
             "commands": [{"type": "openc2", "command": openc2}],
             "on_completion": next_id,
         }
-
         if target_ids:
             action_obj["targets"] = target_ids
 
@@ -480,7 +572,7 @@ def generate_cacao_from_plan(anomaly: Dict[str, Any], plan: Dict[str, Any], tool
         "id": pb_id,
         "name": f"Auto-playbook: {anomaly['signal']['type']} {anomaly['signal']['summary'][:80]}",
         "description": (
-            f"LLM-generated CACAO draft (model={OLLAMA_CHAT_MODEL}) for anomaly "
+            f"LLM-generated CACAO draft (model={get_chat_model()}) for anomaly "
             f"{anomaly.get('anomaly_id','n/a')} [{anomaly['signal']['type']}|{anomaly['signal'].get('severity','n/a')}]. "
             f"Objective={plan.get('objective','n/a')}. Env={anomaly.get('environment','n/a')}. "
             f"Approval={((anomaly.get('constraints') or {}).get('requires_human_approval'))}."
@@ -495,6 +587,118 @@ def generate_cacao_from_plan(anomaly: Dict[str, Any], plan: Dict[str, Any], tool
     }
 
     return playbook
+
+
+# ---------------- Quality metrics (PQS) ----------------
+DISRUPTIVE_ACTIONS = {
+    "isolate_host", "disable_user", "rollback_release",
+    "rotate_api_key", "quarantine_hash"
+}
+
+EXPECTED_ACTIONS = {
+    "availability": {"collect_triage", "rollback_release"},
+    "auth": {"collect_triage", "reset_mfa", "revoke_sessions", "disable_user"},
+    "network": {"collect_triage", "block_ip", "block_domain", "isolate_host"},
+    "malware": {"collect_triage", "quarantine_hash", "isolate_host"},
+    "cloud": {"collect_triage", "rotate_api_key", "disable_user", "revoke_sessions"},
+}
+
+def _plan_actions(plan: Dict[str, Any]) -> List[str]:
+    out = []
+    for s in plan.get("steps", []):
+        out.append(_tool_to_action_name(s.get("tool_id", "")))
+    return out
+
+def _contains_placeholders(obj: Any) -> bool:
+    if isinstance(obj, str):
+        return "{{" in obj or "}}" in obj
+    if isinstance(obj, dict):
+        return any(_contains_placeholders(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_contains_placeholders(v) for v in obj)
+    return False
+
+def compute_quality(
+    anomaly: Dict[str, Any],
+    plan: Dict[str, Any],
+    plan_errors: List[str],
+    cacao: Dict[str, Any],
+    cacao_errors: List[str],
+    tools: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    q: Dict[str, Any] = {"hard": {}, "scores": {}, "notes": [], "pqs_total": 0}
+
+    q["hard"]["plan_ok"] = (len(plan_errors) == 0)
+    q["hard"]["cacao_ok"] = (len(cacao_errors) == 0)
+    q["hard"]["tools_loaded"] = (len(tools) > 0)
+
+    if not q["hard"]["plan_ok"]:
+        q["notes"].append("Plan invalid")
+        return q
+
+    actions = _plan_actions(plan)
+    actions_set = set(actions)
+
+    sig_type = ((anomaly.get("signal") or {}).get("type") or "unknown").lower()
+    expected = EXPECTED_ACTIONS.get(sig_type, {"collect_triage"})
+
+    # Coverage / Fit (0–30): expected actions recall
+    recall = len(actions_set & expected) / max(1, len(expected))
+    q["scores"]["coverage_fit"] = int(round(30 * recall))
+
+    # Safety / Disruption (0–25)
+    sev = ((anomaly.get("signal") or {}).get("severity") or "medium").lower()
+    conf = float((anomaly.get("signal") or {}).get("confidence") or 0.5)
+
+    disruption = 25
+    for a in actions:
+        if a in DISRUPTIVE_ACTIONS:
+            if sev != "high":
+                disruption -= 6
+            if conf < 0.7:
+                disruption -= 4
+    q["scores"]["safety_disruption"] = max(0, min(25, disruption))
+
+    # Completeness (0–20)
+    completeness = 0
+    for s in plan.get("steps", []):
+        why = str(s.get("why", "")).strip()
+        if len(why) >= 8:
+            completeness += 2
+        verify = str(s.get("verify", "")).strip().lower()
+        if verify and verify not in ("n/a", "na"):
+            completeness += 3
+        a = _tool_to_action_name(s.get("tool_id", ""))
+        if a in DISRUPTIVE_ACTIONS:
+            rb = str(s.get("rollback", "")).strip().lower()
+            if rb and rb not in ("n/a", "na"):
+                completeness += 3
+    q["scores"]["completeness"] = min(20, completeness)
+
+    # Actionability (0–10)
+    actionability = 10
+    if not cacao:
+        actionability -= 5
+        q["notes"].append("No CACAO produced")
+    if cacao and _contains_placeholders(cacao):
+        actionability -= 7
+        q["notes"].append("CACAO contains unresolved placeholders")
+    q["scores"]["actionability"] = max(0, min(10, actionability))
+
+    # CACAO validity (0–15)
+    q["scores"]["cacao_validity"] = 15 if q["hard"]["cacao_ok"] else 5
+    if not q["hard"]["cacao_ok"]:
+        q["notes"].append("CACAO schema invalid")
+
+    total = (
+        q["scores"]["coverage_fit"] +
+        q["scores"]["safety_disruption"] +
+        q["scores"]["completeness"] +
+        q["scores"]["actionability"] +
+        q["scores"]["cacao_validity"]
+    )
+    q["pqs_total"] = int(max(0, min(100, total)))
+    return q
 
 
 # ---------------- Persistence ----------------
@@ -564,13 +768,7 @@ def worker_loop() -> None:
     log.info("Worker started. stream=%s group=%s consumer=%s", STREAM_IN, CONSUMER_GROUP, CONSUMER_NAME)
 
     while True:
-        msgs = r.xreadgroup(
-            CONSUMER_GROUP,
-            CONSUMER_NAME,
-            {STREAM_IN: ">"},
-            count=1,
-            block=BLOCK_MS,
-        )
+        msgs = r.xreadgroup(CONSUMER_GROUP, CONSUMER_NAME, {STREAM_IN: ">"}, count=1, block=BLOCK_MS)
         if not msgs:
             continue
 
@@ -581,21 +779,25 @@ def worker_loop() -> None:
         try:
             anomaly = json.loads(fields["json"])
 
-            # -------- Idempotency guard (processed) --------
+            # Fill assets if missing (prevents tool filtering surprises)
+            if not anomaly.get("assets"):
+                anomaly["assets"] = infer_assets_from_entities(anomaly)
+
+            log.info("Active LLM model: %s", get_chat_model())
+
+            # -------- Idempotency --------
             ik = _idemp_key(anomaly)
             processed_key = f"processed:{ik}"
             inprog_key = f"inprog:{ik}"
 
             already = r.get(processed_key)
             if already:
-                log.info("Idempotency: anomaly already processed (case_id=%s). Acking msg_id=%s", already, msg_id)
+                log.info("Idempotency: already processed (case_id=%s). Acking msg_id=%s", already, msg_id)
                 r.xack(STREAM_IN, CONSUMER_GROUP, msg_id)
                 continue
 
-            # best-effort "in progress" lock
             locked = r.set(inprog_key, CONSUMER_NAME, nx=True, ex=INPROGRESS_TTL_SEC)
             if not locked:
-                # Another worker/process likely handling it; PoC choice: ack to avoid duplicates/jams.
                 log.info("Idempotency: in-progress lock exists for %s. Acking msg_id=%s", ik, msg_id)
                 r.xack(STREAM_IN, CONSUMER_GROUP, msg_id)
                 continue
@@ -603,34 +805,36 @@ def worker_loop() -> None:
             notify("anomaly_received", {"anomaly_id": anomaly.get("anomaly_id"), "env": anomaly.get("environment")})
 
             env = anomaly.get("environment", "prod")
-            assets = anomaly.get("assets", [])  # ok if absent
+            assets = anomaly.get("assets", [])
 
             tools_all = load_tools(env, assets)
             tools = filter_tools_by_constraints(tools_all, anomaly)
 
-            log.info("Loaded tools: %d (pre-filter=%d)", len(tools), len(tools_all))
             log.info("Capabilities tool ids: %s", [t["id"] for t in tools])
 
             # ---- Plan generation (LLM) ----
-            plan, llm_ms = plan_selector(anomaly, tools)
-            log.info("Generated plan")
+            fallback_used = False
+            try:
+                plan, llm_ms = plan_selector(anomaly, tools)
+                log.info("Generated plan")
+            except Exception as e:
+                log.warning("Plan generation failed; using deterministic fallback. err=%r", e)
+                plan = build_deterministic_triage_plan(anomaly, tools)
+                llm_ms = 0
+                fallback_used = True
 
             # ---- Plan validation ----
             plan_errors = validate_plan(plan, tools)
             plan_errors += enforce_constraints(plan, anomaly, tools)
 
-            fallback_used = False
+            # If invalid, try deterministic fallback once
             if plan_errors:
-                # Deterministic safe fallback
                 fallback_used = True
-                log.warning("Plan invalid; applying deterministic fallback. Errors=%s", plan_errors)
                 plan = build_deterministic_triage_plan(anomaly, tools)
-
-                # Re-validate fallback plan
                 plan_errors = validate_plan(plan, tools)
                 plan_errors += enforce_constraints(plan, anomaly, tools)
 
-            # ---- CACAO generation + validation (best-effort) ----
+            # ---- CACAO generation + validation ----
             cacao: Dict[str, Any] = {}
             schema_errors: List[str] = []
 
@@ -641,7 +845,7 @@ def worker_loop() -> None:
                 schema_errors = ["CACAO not generated due to plan errors"]
 
             # ---- Timing ----
-            now_ms = int(time.time() * 1000)
+            now_ms = utc_now_ms()
             ingest_ms = int(anomaly.get("ingested_at_ms", now_ms))
             timing = {
                 "ingested_at": anomaly.get("ingested_at"),
@@ -660,9 +864,13 @@ def worker_loop() -> None:
                 "tools_pre_filter": len(tools_all),
             }
 
-            log.info("Plan errors: %d | CACAO schema errors: %d", len(plan_errors), len(schema_errors))
+            # ---- Quality metrics ----
+            validation["quality"] = compute_quality(anomaly, plan, plan_errors, cacao, schema_errors, tools)
 
-            # ---- Fatal only if plan invalid ----
+            log.info("Plan errors: %d | CACAO schema errors: %d", len(plan_errors), len(schema_errors))
+            log.info("PQS=%s details=%s", validation["quality"].get("pqs_total"), validation["quality"])
+
+            # If plan invalid, dead-letter and ack
             if plan_errors:
                 r.xadd(
                     STREAM_OUT_ERRORS,
@@ -671,23 +879,21 @@ def worker_loop() -> None:
                     approximate=True,
                 )
                 r.xack(STREAM_IN, CONSUMER_GROUP, msg_id)
-                # release lock
                 r.delete(inprog_key)
                 continue
 
-            # ---- Persist always (even if CACAO invalid) ----
             status = "DRAFT_READY" if not schema_errors else "DRAFT_INVALID_CACAO"
             log.info("Persisting case (status=%s)...", status)
 
             case_id = persist_case(anomaly, plan, cacao, validation, status=status)
             log.info("Persisted case_id=%s", case_id)
 
-            # mark processed for idempotency + clear lock
+            # mark processed
             r.set(processed_key, case_id, ex=IDEMP_TTL_SEC)
             r.delete(inprog_key)
 
             r.xadd(STREAM_OUT_READY, {"case_id": case_id}, maxlen=MAX_STREAM_LEN, approximate=True)
-            notify("case_created", {"case_id": case_id, "anomaly_id": anomaly.get("anomaly_id")})
+            notify("case_created", {"case_id": case_id, "anomaly_id": anomaly.get("anomaly_id"), "status": status})
 
             r.xack(STREAM_IN, CONSUMER_GROUP, msg_id)
             log.info("OK anomaly=%s case_id=%s", anomaly.get("anomaly_id"), case_id)

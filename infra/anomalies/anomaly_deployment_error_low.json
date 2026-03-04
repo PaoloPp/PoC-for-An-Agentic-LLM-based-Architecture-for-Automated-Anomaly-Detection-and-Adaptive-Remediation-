@@ -1,5 +1,5 @@
 {
-  "anomaly_id": "a-app-2020",
+  "anomaly_id": "a-app-2020_low",
   "timestamp": "2026-02-05T13:22:00Z",
   "resource_group": "rg-prod-payments",
   "environment": "prod",

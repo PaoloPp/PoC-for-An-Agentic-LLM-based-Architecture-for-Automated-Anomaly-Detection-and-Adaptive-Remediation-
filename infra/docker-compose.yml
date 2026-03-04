@@ -27,15 +27,16 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+psycopg://soar:soar@db:5432/soar
-      CACAO_SCHEMA_REPO: cyentific-rni/cacao-json-schemas
-      CACAO_SCHEMA_BRANCH: cacao-v2.0-cs01
-      CACAO_SCHEMA_PATH: schemas/playbook.json
-      OLLAMA_BASE_URL: http://ollama:11434
-      OLLAMA_CHAT_MODEL: llama3.1:8b
-      OLLAMA_EMBED_MODEL: embeddinggemma
-      LLM_MODE: "ollama"
-      # LLM settings (stub-friendly)
-      #LLM_MODE: "stub"   # "stub" or "real"
+      CACAO_SCHEMA_REPO: ${CACAO_SCHEMA_REPO:-cyentific-rni/cacao-json-schemas}
+      CACAO_SCHEMA_BRANCH: ${CACAO_SCHEMA_BRANCH:-cacao-v2.0-cs01}
+      CACAO_SCHEMA_PATH: ${CACAO_SCHEMA_PATH:-schemas/playbook.json}
+
+      # If you run an Ollama container, set OLLAMA_BASE_URL=http://ollama:11434
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-llama3.1:8b}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-embeddinggemma}
+
+      LLM_MODE: ${LLM_MODE:-ollama}
     ports: ["8002:8000"]
     depends_on: [redis, db]
 
@@ -44,15 +45,17 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+psycopg://soar:soar@db:5432/soar
-      CACAO_SCHEMA_REPO: cyentific-rni/cacao-json-schemas
-      CACAO_SCHEMA_BRANCH: cacao-v2.0-cs01
-      CACAO_SCHEMA_PATH: schemas/playbook.json
-      playbook_agent_worker:
-      LLM_MODE: ollama
-      OLLAMA_BASE_URL: http://host.docker.internal:11434
-      OLLAMA_CHAT_MODEL: llama3.1:8b
-      OLLAMA_EMBED_MODEL: embeddinggemma
-      # LLM_MODE: "stub"
+      CACAO_SCHEMA_REPO: ${CACAO_SCHEMA_REPO:-cyentific-rni/cacao-json-schemas}
+      CACAO_SCHEMA_BRANCH: ${CACAO_SCHEMA_BRANCH:-cacao-v2.0-cs01}
+      CACAO_SCHEMA_PATH: ${CACAO_SCHEMA_PATH:-schemas/playbook.json}
+
+      # If you run Ollama on host (macOS): keep host.docker.internal
+      # If you run an Ollama container: set OLLAMA_BASE_URL=http://ollama:11434
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-llama3.1:8b}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-embeddinggemma}
+
+      LLM_MODE: ${LLM_MODE:-ollama}
     command: ["python", "agent.py"]
     depends_on: [redis, db]
 
@@ -72,23 +75,13 @@ services:
     ports: ["8003:8000"]
     depends_on: [redis, db]
 
-# Using Ollama LLM server on host machine
-#   ollama:
-#     image: ollama/ollama:latest
-#     ports:
-#       - "11434:11434"
-#     volumes:
-#       - ollama:/root/.ollama
-  
+  # Using Ollama LLM server in Docker (optional alternative to host Ollama)
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama:/root/.ollama
+
 # volumes:
 #   ollama:
-
-
-
-  # Optional: CACAO Roaster for visual inspection (run separately too)
-  # roaster:
-  #   build:
-  #     context: https://github.com/opencybersecurityalliance/cacao-roaster.git#main:.
-  #     dockerfile: Dockerfile
-  #   ports:
-  #     - "3000:3000"

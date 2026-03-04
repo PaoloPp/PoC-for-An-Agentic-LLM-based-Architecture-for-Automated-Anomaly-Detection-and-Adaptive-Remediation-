@@ -51,7 +51,6 @@ INSERT INTO tools (
   id, name, description, risk, requires_approval, environments, asset_types, inputs_schema, openc2_template
 )
 VALUES
--- 1) EDR: isolate host
 (
   'edr.isolate_host',
   'Isolate host',
@@ -75,8 +74,6 @@ VALUES
     "args":{"duration_minutes":"{{ttl_minutes}}"}
   }'::jsonb
 ),
-
--- 2) IAM: disable user
 (
   'iam.disable_user',
   'Disable user',
@@ -100,8 +97,6 @@ VALUES
     "args":{"reason":"{{reason}}"}
   }'::jsonb
 ),
-
--- 3) Firewall: block IP
 (
   'fw.block_ip',
   'Block IP',
@@ -125,8 +120,6 @@ VALUES
     "args":{"duration_minutes":"{{ttl_minutes}}"}
   }'::jsonb
 ),
-
--- 4) IAM: reset MFA (good for MFA fatigue)
 (
   'iam.reset_mfa',
   'Reset user MFA',
@@ -150,8 +143,6 @@ VALUES
     "args":{"operation":"reset_mfa","reason":"{{reason}}"}
   }'::jsonb
 ),
-
--- 5) IAM: revoke sessions (kill tokens, logouts everywhere)
 (
   'iam.revoke_sessions',
   'Revoke sessions',
@@ -176,8 +167,6 @@ VALUES
     "args":{"operation":"revoke_sessions","scope":"{{scope}}","reason":"{{reason}}"}
   }'::jsonb
 ),
-
--- 6) IAM/Cloud: rotate API key (service account / app key)
 (
   'iam.rotate_api_key',
   'Rotate API key',
@@ -202,8 +191,6 @@ VALUES
     "args":{"operation":"rotate_api_key","key_id":"{{key_id}}","reason":"{{reason}}"}
   }'::jsonb
 ),
-
--- 7) DNS/Proxy: block domain (beaconing, malware C2, etc.)
 (
   'net.block_domain',
   'Block domain',
@@ -227,8 +214,6 @@ VALUES
     "args":{"duration_minutes":"{{ttl_minutes}}"}
   }'::jsonb
 ),
-
--- 8) Email/EDR: quarantine by hash (attachment / binary)
 (
   'edr.quarantine_hash',
   'Quarantine file hash',
@@ -253,8 +238,6 @@ VALUES
     "args":{"operation":"quarantine","scope":"{{scope}}","reason":"{{reason}}"}
   }'::jsonb
 ),
-
--- 9) Endpoint: disable scheduled task (persistence)
 (
   'edr.disable_scheduled_task',
   'Disable scheduled task',
@@ -279,8 +262,6 @@ VALUES
     "args":{"operation":"disable_scheduled_task","task_name":"{{task_name}}","reason":"{{reason}}"}
   }'::jsonb
 ),
-
--- 10) Collect triage
 (
   'soar.collect_triage',
   'Collect triage',
@@ -309,8 +290,6 @@ VALUES
     "args":{"window_minutes":"{{window_minutes}}","include":"{{include}}"}
   }'::jsonb
 ),
-
--- 11) Deployment: rollback release (availability regressions)
 (
   'deploy.rollback_release',
   'Rollback release',
